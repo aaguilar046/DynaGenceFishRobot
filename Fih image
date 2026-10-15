@@ -1,0 +1,302 @@
+"""
+Basic acoustic image link on a 57 kHz channel.
+TX: Keysight 33500B arbitrary waveform -> bench amp -> TX transducer
+RX: RX transducer -> Siglent SDS1202X-E CH2, read back over pyvisa
+Sync: 33500B Sync -> scope EXT TRIG
+
+Modulation: non-coherent BFSK, continuous phase, with two alternating tone
+pairs (even symbols use pair A, odd use pair B) so the reverb tail of one
+symbol doesn't land on the tones used by the next.
+
+Frame: [LFM chirp][gap][8 training syms][16b frame idx][16b nbytes][payload][CRC16][tail]
+Each frame is uploaded as one arb, played once on a bus trigger, captured
+single-shot, demodulated, CRC-checked, and resent on failure.
+"""
+
+import re
+import time
+import binascii
+import numpy as np
+import pyvisa
+from PIL import Image
+from scipy.signal import butter, sosfiltfilt, fftconvolve
+
+# ---------------- user settings ----------------
+GEN_ADDR    = None   # e.g. "USB0::0x0957::0x2C07::MY12345678::INSTR"
+SCOPE_ADDR  = None   # e.g. "TCPIP::192.168.1.50::INSTR"
+
+IMAGE_IN    = "test.png"
+IMG_W, IMG_H = 32, 32          # image is resized to this, 8-bit grayscale
+IMAGE_OUT   = "rx_image.png"
+
+# tones: keep all four inside the pair's usable band (check with the SNR sweep)
+PAIR_A      = (55.5e3, 56.5e3)  # (bit 0, bit 1) for even symbols
+PAIR_B      = (57.5e3, 58.5e3)  # (bit 0, bit 1) for odd symbols
+TS          = 2e-3              # symbol time, s (500 bps). Raise if BER is bad.
+SKIP_FRAC   = 0.15              # fraction of each symbol ignored (transient/ISI)
+
+CHIRP_F     = (53e3, 61e3)
+CHIRP_T     = 5e-3
+GAP_T       = 20e-3             # silence after chirp so its reverb decays
+TAIL_T      = 20e-3
+
+BYTES_PER_FRAME = 64
+MAX_TRIES   = 3
+
+ARB_SRATE   = 400e3             # arb sample rate, Sa/s
+DRIVE_VPP   = 0.5               # Vpp at generator output (into amp input)
+
+VDIV_RX     = 0.01              # V/div CH2
+TDIV        = 0.2               # s/div; 7 div after trigger must cover a frame
+MSIZ        = "1.4M"            # -> ~500 kSa/s at 0.2 s/div
+
+RX_BAND     = (53e3, 61e3)
+# -----------------------------------------------
+
+TRAIN_BITS = [0, 0, 1, 1, 0, 0, 1, 1]   # hits each of the 4 tones twice
+HDR_BITS = 32
+CRC_BITS = 16
+
+
+def num(s):
+    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    return float(m.group())
+
+
+def bytes_to_bits(b):
+    return list(np.unpackbits(np.frombuffer(b, dtype=np.uint8)))
+
+
+def bits_to_bytes(bits):
+    return np.packbits(np.array(bits, dtype=np.uint8)).tobytes()
+
+
+def tone(i, bit):
+    pair = PAIR_A if i % 2 == 0 else PAIR_B
+    return pair[bit]
+
+
+# ---------------- TX ----------------
+def build_frame_bits(idx, payload):
+    hdr = idx.to_bytes(2, "big") + len(payload).to_bytes(2, "big")
+    crc = binascii.crc_hqx(hdr + payload, 0xFFFF).to_bytes(2, "big")
+    return TRAIN_BITS + bytes_to_bits(hdr + payload + crc)
+
+
+def chirp(fs):
+    t = np.arange(int(CHIRP_T * fs)) / fs
+    k = (CHIRP_F[1] - CHIRP_F[0]) / CHIRP_T
+    x = np.sin(2 * np.pi * (CHIRP_F[0] * t + 0.5 * k * t ** 2))
+    return x * np.hanning(len(x)) ** 0.25          # soft edges
+
+
+def build_waveform(bits, fs):
+    ns = int(round(TS * fs))
+    f_inst = np.concatenate([np.full(ns, tone(i, b)) for i, b in enumerate(bits)])
+    phase = 2 * np.pi * np.cumsum(f_inst) / fs      # continuous phase
+    data = np.sin(phase)
+    ramp = min(ns // 4, 50)
+    win = np.ones(len(data))
+    win[:ramp] = np.linspace(0, 1, ramp)
+    win[-ramp:] = np.linspace(1, 0, ramp)
+    data *= win
+    return np.concatenate([chirp(fs),
+                           np.zeros(int(GAP_T * fs)),
+                           data,
+                           np.zeros(int(TAIL_T * fs))])
+
+
+def setup_gen(g):
+    g.write("*RST")
+    g.write("OUTP:LOAD INF")
+    g.write("FORM:BORD SWAP")
+    g.write("OUTP:SYNC ON")
+
+
+def load_and_arm(g, wave):
+    dac = np.round(wave / np.max(np.abs(wave)) * 32767).astype(np.int16)
+    if len(dac) > 1_000_000:
+        raise ValueError("Frame too long for 1 MSa arb memory; reduce BYTES_PER_FRAME or ARB_SRATE")
+    g.write("OUTP OFF")
+    g.write("BURS:STAT OFF")
+    g.write("SOUR1:FUNC SIN")
+    g.write("SOUR1:DATA:VOL:CLE")
+    g.write_binary_values("SOUR1:DATA:ARB:DAC frame,", dac,
+                          datatype="h", is_big_endian=False)
+    g.write("SOUR1:FUNC:ARB frame")
+    g.write("SOUR1:FUNC ARB")
+    g.write(f"SOUR1:FUNC:ARB:SRAT {ARB_SRATE}")
+    g.write(f"SOUR1:VOLT {DRIVE_VPP}")
+    g.write("SOUR1:VOLT:OFFS 0")
+    g.write("BURS:MODE TRIG")
+    g.write("BURS:NCYC 1")
+    g.write("TRIG:SOUR BUS")
+    g.write("BURS:STAT ON")
+    g.write("OUTP ON")
+    g.query("*OPC?")
+    err = g.query("SYST:ERR?").strip()
+    if not err.startswith("+0"):
+        print("  33500B error:", err)
+
+
+# ---------------- RX ----------------
+def setup_scope(s):
+    s.write("CHDR OFF")
+    s.write("C2:TRA ON")
+    s.write("C2:ATTN 1")
+    s.write("C2:CPL A1M")
+    s.write("C2:BWL ON")
+    s.write(f"C2:VDIV {VDIV_RX:.3E}V")
+    s.write("C2:OFST 0V")
+    s.write(f"TDIV {TDIV:.2E}S")
+    s.write("TRDL 0S")
+    s.write(f"MSIZ {MSIZ}")
+    s.write("ACQW SAMPLING")
+    s.write("TRSE EDGE,SR,EX,HT,OFF")
+    s.write("EX:TRSL POS")
+    s.write("EX:TRLV 1V")
+
+
+def arm_scope(s):
+    s.write("TRMD SINGLE")
+    time.sleep(0.3)
+
+
+def read_scope(s, timeout=10):
+    t0 = time.time()
+    while "stop" not in s.query("SAST?").lower():
+        if time.time() - t0 > timeout:
+            raise TimeoutError("Scope never triggered")
+        time.sleep(0.1)
+    vdiv = num(s.query("C2:VDIV?"))
+    ofst = num(s.query("C2:OFST?"))
+    sara = num(s.query("SARA?"))
+    s.write("WFSU SP,0,NP,0,FP,0")
+    s.write("C2:WF? DAT2")
+    raw = s.read_raw()
+    i = raw.find(b"#9")
+    n = int(raw[i + 2:i + 11])
+    code = np.frombuffer(raw[i + 11:i + 11 + n], dtype=np.int8).astype(float)
+    v = code * (vdiv / 25.0) - ofst
+    t = np.arange(len(v)) / sara - TDIV * 7
+    return t, v, sara
+
+
+def demod(t, v, fs, n_bits):
+    sos = butter(4, RX_BAND, btype="band", fs=fs, output="sos")
+    y = sosfiltfilt(sos, v)
+
+    tpl = chirp(fs)
+    corr = np.abs(fftconvolve(y, tpl[::-1], mode="valid"))
+    corr[: np.searchsorted(t, -1e-3)] = 0           # ignore pre-trigger
+    n0 = int(np.argmax(corr))
+
+    ns = TS * fs
+    start = n0 + (CHIRP_T + GAP_T) * fs
+    skip = int(SKIP_FRAC * ns)
+    tt = np.arange(int(ns) - skip) / fs
+
+    energies = []
+    for i in range(n_bits):
+        a = int(round(start + i * ns)) + skip
+        seg = y[a:a + len(tt)]
+        if len(seg) < len(tt):
+            return None, None
+        e = [np.abs(np.dot(seg, np.exp(-2j * np.pi * tone(i, b) * tt))) ** 2
+             for b in (0, 1)]
+        energies.append(e)
+    energies = np.array(energies)
+
+    # per-tone gain from training symbols
+    gain = {}
+    for i, b in enumerate(TRAIN_BITS):
+        gain.setdefault(tone(i, b), []).append(energies[i, b])
+    gain = {f: np.mean(g) for f, g in gain.items()}
+
+    bits = []
+    for i in range(n_bits):
+        e0 = energies[i, 0] / gain[tone(i, 0)]
+        e1 = energies[i, 1] / gain[tone(i, 1)]
+        bits.append(int(e1 > e0))
+    return bits, corr[n0]
+
+
+def parse(bits):
+    raw = bits_to_bytes(bits[len(TRAIN_BITS):])
+    hdr, crc = raw[:4], raw[-2:]
+    idx = int.from_bytes(hdr[:2], "big")
+    nbytes = int.from_bytes(hdr[2:4], "big")
+    payload = raw[4:4 + nbytes]
+    ok = binascii.crc_hqx(hdr + payload, 0xFFFF).to_bytes(2, "big") == crc
+    return ok, idx, payload
+
+
+# ---------------- main ----------------
+def main():
+    rm = pyvisa.ResourceManager()
+    if GEN_ADDR is None or SCOPE_ADDR is None:
+        print("Set GEN_ADDR and SCOPE_ADDR. Found:")
+        for r in rm.list_resources():
+            print("  ", r)
+        return
+
+    g = rm.open_resource(GEN_ADDR)
+    s = rm.open_resource(SCOPE_ADDR)
+    g.timeout = 60000
+    s.timeout = 60000
+    s.chunk_size = 1 << 20
+    setup_gen(g)
+    setup_scope(s)
+
+    img = Image.open(IMAGE_IN).convert("L").resize((IMG_W, IMG_H))
+    data = img.tobytes()
+    frames = [data[i:i + BYTES_PER_FRAME] for i in range(0, len(data), BYTES_PER_FRAME)]
+    rx = bytearray(b"\x80" * len(data))            # gray fill for lost frames
+
+    frame_dur = (CHIRP_T + GAP_T + TAIL_T +
+                 (len(TRAIN_BITS) + HDR_BITS + 8 * BYTES_PER_FRAME + CRC_BITS) * TS)
+    print(f"{len(frames)} frames, ~{frame_dur:.2f} s air time each, "
+          f"{1/TS:.0f} bps raw")
+    if frame_dur > 7 * TDIV * 0.95:
+        print("WARNING: frame longer than post-trigger capture; raise TDIV")
+
+    total_err = total_bits = 0
+    for idx, payload in enumerate(frames):
+        tx_bits = build_frame_bits(idx, payload)
+        load_and_arm(g, build_waveform(tx_bits, ARB_SRATE))
+
+        for attempt in range(1, MAX_TRIES + 1):
+            arm_scope(s)
+            g.write("*TRG")
+            t, v, fs = read_scope(s, timeout=frame_dur + 10)
+            if attempt == 1 and idx == 0 and fs < 4 * RX_BAND[1]:
+                print(f"WARNING: scope sample rate {fs:.0f} Sa/s is too low")
+            rx_bits, pk = demod(t, v, fs, len(tx_bits))
+            if rx_bits is None:
+                print(f"frame {idx:3d} try {attempt}: capture too short")
+                continue
+            errs = int(np.sum(np.array(rx_bits) != np.array(tx_bits)))
+            ok, ridx, rpay = parse(rx_bits)
+            print(f"frame {idx:3d} try {attempt}: bit errors {errs:4d}/{len(tx_bits)} "
+                  f"CRC {'OK ' if ok else 'BAD'}")
+            total_err += errs
+            total_bits += len(tx_bits)
+            if ok and ridx == idx:
+                start = idx * BYTES_PER_FRAME
+                rx[start:start + len(rpay)] = rpay
+                break
+        time.sleep(0.1)
+
+    g.write("OUTP OFF")
+
+    Image.frombytes("L", (IMG_W, IMG_H), bytes(rx)).save(IMAGE_OUT)
+    side = Image.new("L", (IMG_W * 2 + 4, IMG_H), 255)
+    side.paste(img, (0, 0))
+    side.paste(Image.open(IMAGE_OUT), (IMG_W + 4, 0))
+    side.resize((side.width * 8, side.height * 8), Image.NEAREST).save("tx_vs_rx.png")
+    print(f"\nRaw BER: {total_err}/{total_bits} = {total_err/max(total_bits,1):.2e}")
+    print(f"Saved {IMAGE_OUT} and tx_vs_rx.png")
+
+
+if __name__ == "__main__":
+    main()
