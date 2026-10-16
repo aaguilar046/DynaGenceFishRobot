@@ -1,33 +1,38 @@
 """
 Basic acoustic image link on a 57 kHz channel.
-TX: Keysight 33500B arbitrary waveform -> bench amp -> TX transducer
-RX: RX transducer -> Siglent SDS1202X-E CH2, read back over pyvisa
-Sync: 33500B Sync -> scope EXT TRIG
+TX: NI USB-6341 AO0 -> bench amp -> TX transducer
+RX: RX transducer -> NI USB-6341 AI0
+Sync: AI0 acquisition is started by the AO start trigger inside the 6341
 
 Modulation: non-coherent BFSK, continuous phase, with two alternating tone
 pairs (even symbols use pair A, odd use pair B) so the reverb tail of one
 symbol doesn't land on the tones used by the next.
 
 Frame: [LFM chirp][gap][8 training syms][16b frame idx][16b nbytes][payload][CRC16][tail]
-Each frame is uploaded as one arb, played once on a bus trigger, captured
-single-shot, demodulated, CRC-checked, and resent on failure.
+Each frame is played once as a finite AO generation while AI0 records it,
+then demodulated, CRC-checked, and resent on failure.
 """
 
-import re
+import os
 import time
 import binascii
 import numpy as np
-import pyvisa
-from PIL import Image
+import nidaqmx
+from nidaqmx.constants import AcquisitionType, TerminalConfiguration
+from PIL import Image, ImageDraw, ImageFont
 from scipy.signal import butter, sosfiltfilt, fftconvolve
 
 # ---------------- user settings ----------------
-GEN_ADDR    = None   # e.g. "USB0::0x0957::0x2C07::MY12345678::INSTR"
-SCOPE_ADDR  = None   # e.g. "TCPIP::192.168.1.50::INSTR"
+DEV         = "Dev1"            # NI USB-6341
+AO_CHAN     = f"{DEV}/ao0"      # TX waveform -> amp input
+AI_CHAN     = f"{DEV}/ai0"      # RX transducer
+AI_TERM     = TerminalConfiguration.DIFF   # AI0+ / AI0- (pins 1 / 2)
 
 IMAGE_IN    = "test.png"
-IMG_W, IMG_H = 32, 32          # image is resized to this, 8-bit grayscale
+IMG_W, IMG_H = 128, 128        # image is resized to this, 8-bit grayscale
 IMAGE_OUT   = "rx_image.png"
+COMPARE_OUT = "tx_vs_rx.png"    # labeled side-by-side TX / RX image
+SHOW_RESULT = True              # pop up COMPARE_OUT when the run finishes
 
 # tones: keep all four inside the pair's usable band (check with the SNR sweep)
 PAIR_A      = (55.5e3, 56.5e3)  # (bit 0, bit 1) for even symbols
@@ -43,24 +48,23 @@ TAIL_T      = 20e-3
 BYTES_PER_FRAME = 64
 MAX_TRIES   = 3
 
-ARB_SRATE   = 400e3             # arb sample rate, Sa/s
-DRIVE_VPP   = 0.5               # Vpp at generator output (into amp input)
+ARB_SRATE   = 400e3             # AO update rate, Sa/s
+DRIVE_VPP   = 0.5               # Vpp at AO0 (into amp input)
+MAX_VPP     = 0.5               # hard limit on AO0, enforced in software and by DAQmx
 
-VDIV_RX     = 0.01              # V/div CH2
-TDIV        = 0.2               # s/div; 7 div after trigger must cover a frame
-MSIZ        = "1.4M"            # -> ~500 kSa/s at 0.2 s/div
+AI_SRATE    = 500e3             # AI0 sample rate, Sa/s (6341 max for one channel)
+AI_RANGE    = 0.2               # AI0 input range, +/- V (smallest 6341 range)
+RX_EXTRA_T  = 50e-3             # record this long past the end of the frame
 
 RX_BAND     = (53e3, 61e3)
+
+CSV_OUT     = False             # True: just write each frame to a CSV, no instruments
+CSV_DIR     = "D:/csv_frames"   # one file per frame, samples normalized to +/-1
 # -----------------------------------------------
 
 TRAIN_BITS = [0, 0, 1, 1, 0, 0, 1, 1]   # hits each of the 4 tones twice
 HDR_BITS = 32
 CRC_BITS = 16
-
-
-def num(s):
-    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
-    return float(m.group())
 
 
 def bytes_to_bits(b):
@@ -106,89 +110,50 @@ def build_waveform(bits, fs):
                            np.zeros(int(TAIL_T * fs))])
 
 
-def setup_gen(g):
-    g.write("*RST")
-    g.write("OUTP:LOAD INF")
-    g.write("FORM:BORD SWAP")
-    g.write("OUTP:SYNC ON")
+def tx_buffer(wave):
+    if DRIVE_VPP > MAX_VPP:
+        raise ValueError(f"DRIVE_VPP {DRIVE_VPP} V exceeds MAX_VPP {MAX_VPP} V")
+    data = np.clip(wave / np.max(np.abs(wave)) * DRIVE_VPP / 2,
+                   -MAX_VPP / 2, MAX_VPP / 2)
+    data[-1] = 0                                    # leave AO0 at 0 V
+    if np.ptp(data) > MAX_VPP:
+        raise ValueError(f"AO0 buffer is {np.ptp(data):.4f} Vpp, over {MAX_VPP} V")
+    return data
 
 
-def load_and_arm(g, wave):
-    dac = np.round(wave / np.max(np.abs(wave)) * 32767).astype(np.int16)
-    if len(dac) > 1_000_000:
-        raise ValueError("Frame too long for 1 MSa arb memory; reduce BYTES_PER_FRAME or ARB_SRATE")
-    g.write("OUTP OFF")
-    g.write("BURS:STAT OFF")
-    g.write("SOUR1:FUNC SIN")
-    g.write("SOUR1:DATA:VOL:CLE")
-    g.write_binary_values("SOUR1:DATA:ARB:DAC frame,", dac,
-                          datatype="h", is_big_endian=False)
-    g.write("SOUR1:FUNC:ARB frame")
-    g.write("SOUR1:FUNC ARB")
-    g.write(f"SOUR1:FUNC:ARB:SRAT {ARB_SRATE}")
-    g.write(f"SOUR1:VOLT {DRIVE_VPP}")
-    g.write("SOUR1:VOLT:OFFS 0")
-    g.write("BURS:MODE TRIG")
-    g.write("BURS:NCYC 1")
-    g.write("TRIG:SOUR BUS")
-    g.write("BURS:STAT ON")
-    g.write("OUTP ON")
-    g.query("*OPC?")
-    err = g.query("SYST:ERR?").strip()
-    if not err.startswith("+0"):
-        print("  33500B error:", err)
+# ---------------- TX + RX ----------------
+def txrx(tx):
+    """Play tx on AO0 and record AI0, both started by the same AO start trigger."""
+    n_ai = int((len(tx) / ARB_SRATE + RX_EXTRA_T) * AI_SRATE)
+    with nidaqmx.Task() as ao, nidaqmx.Task() as ai:
+        # DAQmx rejects the write if any sample is outside these limits
+        ao.ao_channels.add_ao_voltage_chan(AO_CHAN, min_val=-MAX_VPP / 2, max_val=MAX_VPP / 2)
+        ao.timing.cfg_samp_clk_timing(ARB_SRATE, sample_mode=AcquisitionType.FINITE,
+                                      samps_per_chan=len(tx))
+        ao.write(tx, auto_start=False)
+
+        ai.ai_channels.add_ai_voltage_chan(AI_CHAN, terminal_config=AI_TERM,
+                                           min_val=-AI_RANGE, max_val=AI_RANGE)
+        ai.timing.cfg_samp_clk_timing(AI_SRATE, sample_mode=AcquisitionType.FINITE,
+                                      samps_per_chan=n_ai)
+        ai.triggers.start_trigger.cfg_dig_edge_start_trig(f"/{DEV}/ao/StartTrigger")
+
+        ai.start()                                  # waits for the AO start trigger
+        ao.start()
+        v = np.array(ai.read(number_of_samples_per_channel=n_ai,
+                             timeout=n_ai / AI_SRATE + 5))
+        ao.wait_until_done(timeout=5)
+    t = np.arange(n_ai) / AI_SRATE                  # t = 0 at the first TX sample
+    return t, v, AI_SRATE
 
 
 # ---------------- RX ----------------
-def setup_scope(s):
-    s.write("CHDR OFF")
-    s.write("C2:TRA ON")
-    s.write("C2:ATTN 1")
-    s.write("C2:CPL A1M")
-    s.write("C2:BWL ON")
-    s.write(f"C2:VDIV {VDIV_RX:.3E}V")
-    s.write("C2:OFST 0V")
-    s.write(f"TDIV {TDIV:.2E}S")
-    s.write("TRDL 0S")
-    s.write(f"MSIZ {MSIZ}")
-    s.write("ACQW SAMPLING")
-    s.write("TRSE EDGE,SR,EX,HT,OFF")
-    s.write("EX:TRSL POS")
-    s.write("EX:TRLV 1V")
-
-
-def arm_scope(s):
-    s.write("TRMD SINGLE")
-    time.sleep(0.3)
-
-
-def read_scope(s, timeout=10):
-    t0 = time.time()
-    while "stop" not in s.query("SAST?").lower():
-        if time.time() - t0 > timeout:
-            raise TimeoutError("Scope never triggered")
-        time.sleep(0.1)
-    vdiv = num(s.query("C2:VDIV?"))
-    ofst = num(s.query("C2:OFST?"))
-    sara = num(s.query("SARA?"))
-    s.write("WFSU SP,0,NP,0,FP,0")
-    s.write("C2:WF? DAT2")
-    raw = s.read_raw()
-    i = raw.find(b"#9")
-    n = int(raw[i + 2:i + 11])
-    code = np.frombuffer(raw[i + 11:i + 11 + n], dtype=np.int8).astype(float)
-    v = code * (vdiv / 25.0) - ofst
-    t = np.arange(len(v)) / sara - TDIV * 7
-    return t, v, sara
-
-
 def demod(t, v, fs, n_bits):
     sos = butter(4, RX_BAND, btype="band", fs=fs, output="sos")
     y = sosfiltfilt(sos, v)
 
     tpl = chirp(fs)
     corr = np.abs(fftconvolve(y, tpl[::-1], mode="valid"))
-    corr[: np.searchsorted(t, -1e-3)] = 0           # ignore pre-trigger
     n0 = int(np.argmax(corr))
 
     ns = TS * fs
@@ -231,22 +196,43 @@ def parse(bits):
     return ok, idx, payload
 
 
+def write_csvs(frames):
+    os.makedirs(CSV_DIR, exist_ok=True)
+    for idx, payload in enumerate(frames):
+        wave = build_waveform(build_frame_bits(idx, payload), ARB_SRATE)
+        wave = wave / np.max(np.abs(wave))
+        path = os.path.join(CSV_DIR, f"frame_{idx:03d}.csv")
+        np.savetxt(path, wave, fmt="%.5f")
+        print(f"  {path}: {len(wave)} samples, {len(wave) / ARB_SRATE:.3f} s")
+    print(f"Wrote {len(frames)} files to {CSV_DIR}/ "
+          f"(play at {ARB_SRATE:.0f} Sa/s, {DRIVE_VPP} Vpp)")
+
+
+def compare_image(tx_img, rx_img, gap=24, label_h=44):
+    """Side-by-side TX / RX image, scaled up to ~400 px, with a label above each."""
+    scale = max(1, round(400 / max(IMG_W, IMG_H)))
+    w, h = IMG_W * scale, IMG_H * scale
+    out = Image.new("L", (2 * w + gap, h + label_h), 255)
+    draw = ImageDraw.Draw(out)
+    font = ImageFont.load_default(size=28)
+    for i, (im, label) in enumerate([(tx_img, "Sent (TX)"), (rx_img, "Received (RX)")]):
+        x = i * (w + gap)
+        out.paste(im.resize((w, h), Image.NEAREST), (x, label_h))
+        draw.text((x + w // 2, label_h // 2), label, fill=0, font=font, anchor="mm")
+    return out
+
+
 # ---------------- main ----------------
 def main():
-    rm = pyvisa.ResourceManager()
-    if GEN_ADDR is None or SCOPE_ADDR is None:
-        print("Set GEN_ADDR and SCOPE_ADDR. Found:")
-        for r in rm.list_resources():
-            print("  ", r)
+    if CSV_OUT:
+        img = Image.open(IMAGE_IN).convert("L").resize((IMG_W, IMG_H))
+        data = img.tobytes()
+        write_csvs([data[i:i + BYTES_PER_FRAME] for i in range(0, len(data), BYTES_PER_FRAME)])
         return
 
-    g = rm.open_resource(GEN_ADDR)
-    s = rm.open_resource(SCOPE_ADDR)
-    g.timeout = 60000
-    s.timeout = 60000
-    s.chunk_size = 1 << 20
-    setup_gen(g)
-    setup_scope(s)
+    for out in (IMAGE_OUT, COMPARE_OUT):
+        if os.path.abspath(out) == os.path.abspath(IMAGE_IN):
+            raise ValueError(f"{out} would overwrite the input image {IMAGE_IN}")
 
     img = Image.open(IMAGE_IN).convert("L").resize((IMG_W, IMG_H))
     data = img.tobytes()
@@ -257,20 +243,14 @@ def main():
                  (len(TRAIN_BITS) + HDR_BITS + 8 * BYTES_PER_FRAME + CRC_BITS) * TS)
     print(f"{len(frames)} frames, ~{frame_dur:.2f} s air time each, "
           f"{1/TS:.0f} bps raw")
-    if frame_dur > 7 * TDIV * 0.95:
-        print("WARNING: frame longer than post-trigger capture; raise TDIV")
 
     total_err = total_bits = 0
     for idx, payload in enumerate(frames):
         tx_bits = build_frame_bits(idx, payload)
-        load_and_arm(g, build_waveform(tx_bits, ARB_SRATE))
+        tx_data = tx_buffer(build_waveform(tx_bits, ARB_SRATE))
 
         for attempt in range(1, MAX_TRIES + 1):
-            arm_scope(s)
-            g.write("*TRG")
-            t, v, fs = read_scope(s, timeout=frame_dur + 10)
-            if attempt == 1 and idx == 0 and fs < 4 * RX_BAND[1]:
-                print(f"WARNING: scope sample rate {fs:.0f} Sa/s is too low")
+            t, v, fs = txrx(tx_data)
             rx_bits, pk = demod(t, v, fs, len(tx_bits))
             if rx_bits is None:
                 print(f"frame {idx:3d} try {attempt}: capture too short")
@@ -287,15 +267,14 @@ def main():
                 break
         time.sleep(0.1)
 
-    g.write("OUTP OFF")
-
-    Image.frombytes("L", (IMG_W, IMG_H), bytes(rx)).save(IMAGE_OUT)
-    side = Image.new("L", (IMG_W * 2 + 4, IMG_H), 255)
-    side.paste(img, (0, 0))
-    side.paste(Image.open(IMAGE_OUT), (IMG_W + 4, 0))
-    side.resize((side.width * 8, side.height * 8), Image.NEAREST).save("tx_vs_rx.png")
+    rx_img = Image.frombytes("L", (IMG_W, IMG_H), bytes(rx))
+    rx_img.save(IMAGE_OUT)
+    side = compare_image(img, rx_img)
+    side.save(COMPARE_OUT)
     print(f"\nRaw BER: {total_err}/{total_bits} = {total_err/max(total_bits,1):.2e}")
-    print(f"Saved {IMAGE_OUT} and tx_vs_rx.png")
+    print(f"Saved {IMAGE_OUT} and {COMPARE_OUT}")
+    if SHOW_RESULT:
+        side.show()                                 # opens in the default image viewer
 
 
 if __name__ == "__main__":
